@@ -25,7 +25,7 @@ import sys
 import json
 import math
 from datetime import datetime, timedelta
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Set
 from dotenv import load_dotenv
 from colorama import init, Fore, Style
 import logging
@@ -55,6 +55,38 @@ class VolumeFarmingStrategy:
     by rotating positions to maximize volume and funding rate capture.
     """
 
+    @staticmethod
+    def _normalize_symbol(symbol: Optional[str]) -> Optional[str]:
+        """Convert symbols to uppercase without separators for consistent comparison."""
+
+        if not symbol:
+            return None
+
+        return symbol.replace('/', '').upper()
+
+    def _normalize_allowed_pairs(self, pairs: Optional[List[str]]) -> Set[str]:
+        """Return a set of normalised allowed pairs for quick membership checks."""
+
+        if not pairs:
+            return set()
+
+        normalized = {
+            normalized
+            for normalized in (self._normalize_symbol(p) for p in pairs)
+            if normalized
+        }
+
+        return normalized
+
+    def _symbol_allowed(self, symbol: str) -> bool:
+        """Return True if symbol is part of the configured trading universe."""
+
+        if not self._allowed_pairs_normalized:
+            return True
+
+        normalized = self._normalize_symbol(symbol)
+        return normalized in self._allowed_pairs_normalized if normalized else False
+
     def __init__(
         self,
         capital_fraction: float = 0.95,
@@ -65,6 +97,7 @@ class VolumeFarmingStrategy:
         use_funding_ma: bool = True,
         funding_ma_periods: int = 10,
         leverage: int = 1,
+        allowed_pairs: Optional[List[str]] = None,
         enable_forced_rotation: bool = True,
         forced_rotation_min_hours: float = 4.0,
         forced_rotation_apr_multiplier: float = 2.0
@@ -109,6 +142,10 @@ class VolumeFarmingStrategy:
         self.enable_forced_rotation = enable_forced_rotation
         self.forced_rotation_min_hours = forced_rotation_min_hours
         self.forced_rotation_apr_multiplier = forced_rotation_apr_multiplier
+
+        # Normalise and store allowed pairs (if provided)
+        self.allowed_pairs = allowed_pairs or []
+        self._allowed_pairs_normalized = self._normalize_allowed_pairs(self.allowed_pairs)
 
         # Calculate emergency stop-loss automatically based on leverage
         # This ensures we stay safely away from liquidation
@@ -158,6 +195,10 @@ class VolumeFarmingStrategy:
             print(f"{Fore.YELLOW}{'='*80}{Style.RESET_ALL}\n")
         else:
             logger.info(f"Leverage: {Fore.MAGENTA}{leverage}x{Style.RESET_ALL} (Perp: {Fore.CYAN}{100/(leverage+1):.1f}%{Style.RESET_ALL}, Spot: {Fore.CYAN}{100*leverage/(leverage+1):.1f}%{Style.RESET_ALL})")
+
+        if self._allowed_pairs_normalized:
+            pretty_pairs = ', '.join(self.allowed_pairs)
+            logger.info(f"Restricted trading universe: {Fore.MAGENTA}{pretty_pairs}{Style.RESET_ALL}")
 
         logger.info(f"Min Funding APR: {Fore.GREEN}{min_funding_apr}%{Style.RESET_ALL}")
         logger.info(f"Fee Coverage Multiplier: {Fore.CYAN}{fee_coverage_multiplier}x{Style.RESET_ALL}")
@@ -910,6 +951,8 @@ class VolumeFarmingStrategy:
 
                 # Get all available symbols first
                 available_symbols = await self.api_manager.discover_delta_neutral_pairs()
+                available_symbols = [s for s in available_symbols if self._symbol_allowed(s)]
+
                 if not available_symbols:
                     logger.warning("No delta-neutral pairs available")
                     return None
@@ -969,6 +1012,8 @@ class VolumeFarmingStrategy:
                 funding_rates = []
                 for rate_data in current_funding_rates_data:
                     symbol = rate_data['symbol']
+                    if not self._symbol_allowed(symbol):
+                        continue
                     current_rate = rate_data['rate']
 
                     # Skip if current rate is negative
@@ -995,6 +1040,11 @@ class VolumeFarmingStrategy:
             available_pairs = await self.api_manager.discover_delta_neutral_pairs()
             if not available_pairs:
                 logger.warning("No delta-neutral pairs available")
+                return None
+
+            available_pairs = [s for s in available_pairs if self._symbol_allowed(s)]
+            if not available_pairs:
+                logger.warning("No delta-neutral pairs available after applying allowed pair filter")
                 return None
 
             # Fetch 24h volumes for filtering
@@ -1545,8 +1595,8 @@ class VolumeFarmingStrategy:
                     if apr_improvement > 10.0:
                         logger.info(f"  {Fore.GREEN}APR improved by +{apr_improvement:.2f}% ({current_apr:.2f}% → {new_apr:.2f}%){Style.RESET_ALL}")
                 else:
-                    # Only rotate if improvement is > 10% APR points AND we've held for at least 4 hours AND it's a different symbol
-                    if apr_improvement > 10.0 and hours_elapsed >= 4.0:
+                    # Only rotate if improvement is > 10% APR points AND we've held long enough AND it's a different symbol
+                    if apr_improvement > 10.0 and hours_elapsed >= self.forced_rotation_min_hours:
                         logger.info(f"{Fore.YELLOW}Better opportunity found: {Fore.MAGENTA}{best_symbol}{Style.RESET_ALL} ({Fore.GREEN}{new_apr:.2f}%{Style.RESET_ALL} vs {Fore.CYAN}{current_apr:.2f}%{Style.RESET_ALL}) - improvement: {Fore.GREEN}+{apr_improvement:.2f}%{Style.RESET_ALL}")
                         return True
 
@@ -1713,6 +1763,7 @@ def load_config(config_file: str = 'config_volume_farming_strategy.json') -> Dic
         'use_funding_ma': True,
         'funding_ma_periods': 10,
         'leverage': 1,
+        'allowed_pairs': [],
         'enable_forced_rotation': True,
         'forced_rotation_min_hours': 4.0,
         'forced_rotation_apr_multiplier': 2.0
@@ -1750,6 +1801,12 @@ def load_config(config_file: str = 'config_volume_farming_strategy.json') -> Dic
             config['enable_forced_rotation'] = pm.get('enable_forced_rotation', config['enable_forced_rotation'])
             config['forced_rotation_min_hours'] = pm.get('forced_rotation_min_hours', config['forced_rotation_min_hours'])
             config['forced_rotation_apr_multiplier'] = pm.get('forced_rotation_apr_multiplier', config['forced_rotation_apr_multiplier'])
+
+        if 'trading_universe' in config_data:
+            tu = config_data['trading_universe']
+            allowed_pairs = tu.get('allowed_pairs')
+            if isinstance(allowed_pairs, list):
+                config['allowed_pairs'] = allowed_pairs
 
         # Leverage settings (support both old 'risk_management' and new 'leverage_settings' for backward compatibility)
         if 'leverage_settings' in config_data:
@@ -1803,6 +1860,7 @@ async def main():
         use_funding_ma=config['use_funding_ma'],
         funding_ma_periods=config['funding_ma_periods'],
         leverage=config['leverage'],
+        allowed_pairs=config['allowed_pairs'],
         enable_forced_rotation=config['enable_forced_rotation'],
         forced_rotation_min_hours=config['forced_rotation_min_hours'],
         forced_rotation_apr_multiplier=config['forced_rotation_apr_multiplier']
